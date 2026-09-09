@@ -397,7 +397,13 @@ class Trainer:
         if batch_size is None:
             batch_size = 1
 
-        context_length = self.model.config.context_length
+        model_config = (
+            self.model.module.config
+            if hasattr(self.model, "module")
+            else self.model.config
+        )
+
+        context_length = model_config.context_length
 
         # --------------------------------------------------
         # Global token count
