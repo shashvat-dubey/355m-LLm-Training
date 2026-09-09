@@ -1,11 +1,12 @@
 import time
+from contextlib import nullcontext
 
 import torch
-from torch.utils.data import DataLoader
 
 from model.gpt import GPT
 from training.loss import language_modeling_loss
 from evaluation.loss import evaluate_loss, perplexity
+
 from utils.device import get_device
 from utils.logging import TensorBoardLogger
 from utils.precision import (
@@ -18,41 +19,65 @@ from utils.precision import (
 class Trainer:
     def __init__(
         self,
-        model: GPT,
-        dataloader: DataLoader,
-        optimizer: torch.optim.Optimizer,
+        model,
+        dataloader,
+        optimizer,
         scheduler=None,
-        gradient_accumulation_steps: int = 1,
-        max_grad_norm: float = 1.0,
-        precision: str = "fp32",
-        use_tf32: bool = True,
+        gradient_accumulation_steps=1,
+        max_grad_norm=1.0,
+        precision="fp32",
+        use_tf32=True,
         checkpoint_manager=None,
-        checkpoint_interval: int = 0,
+        checkpoint_interval=0,
         eval_dataloader=None,
-        eval_interval: int = 0,
-        eval_batches: int = 10,
+        eval_interval=0,
+        eval_batches=10,
         logger=None,
+        local_rank=None,
+        rank=0,
+        world_size=1,
+        log_interval=10,
+
     ):
         self.model = model
         self.dataloader = dataloader
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-        self.gradient_accumulation_steps = (
-            gradient_accumulation_steps
-        )
-
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
-
-        self.device = get_device()
 
         self.precision = precision.lower()
 
-        if self.precision not in {
-            "fp32",
-            "fp16",
-            "bf16",
-        }:
+        self.checkpoint_manager = checkpoint_manager
+        self.checkpoint_interval = checkpoint_interval
+
+        self.eval_dataloader = eval_dataloader
+        self.eval_interval = eval_interval
+        self.eval_batches = eval_batches
+
+        self.logger = logger
+        self.log_interval = log_interval
+        # Distributed information
+        self.local_rank = local_rank
+        self.rank = rank
+        self.world_size = world_size
+
+        self.is_main_process = self.rank == 0
+        # --------------------------------------------------
+        # Device
+        # --------------------------------------------------
+
+        self.device = get_device(local_rank)
+
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+
+        # --------------------------------------------------
+        # Precision
+        # --------------------------------------------------
+
+        if self.precision not in {"fp32", "fp16", "bf16"}:
             raise ValueError(
                 f"Unsupported precision: {self.precision}"
             )
@@ -67,39 +92,49 @@ class Trainer:
         self.scaler = None
 
         if self.use_scaler:
-            self.scaler = torch.amp.GradScaler(
-                "cuda"
-            )
+            self.scaler = torch.amp.GradScaler("cuda")
+
+        # --------------------------------------------------
+        # Move model
+        # --------------------------------------------------
 
         self.model.to(self.device)
 
-        self.checkpoint_manager = (
-            checkpoint_manager
-        )
+        # --------------------------------------------------
+        # Initial state
+        # --------------------------------------------------
 
-        self.checkpoint_interval = (
-            checkpoint_interval
-        )
+        self.global_step = 0
 
-        self.eval_dataloader = eval_dataloader
-        self.eval_interval = eval_interval
-        self.eval_batches = eval_batches
+        self.optimizer.zero_grad(set_to_none=True)
 
-        self.logger = logger
+        if self.is_main_process:
+            parameter_count = sum(
+                parameter.numel()
+                for parameter in self.model.parameters()
+            )
 
-        print(
-            f"Precision: {self.precision}"
-        )
+            print(f"Device: {self.device}")
+            print(f"World size: {self.world_size}")
+            print(f"Parameters: {parameter_count:,}")
+            print(
+                f"Precision: {self.precision}"
+            )
+            print(
+                f"GradScaler: {self.use_scaler}"
+            )
 
-        print(
-            f"GradScaler: {self.use_scaler}"
-        )
+    # ======================================================
+    # Single microbatch
+    # ======================================================
 
     def train_step(
         self,
-        x,
-        targets,
+        batch,
+        sync_gradients=True,
     ):
+        x, targets = batch
+
         x = x.to(
             self.device,
             non_blocking=True,
@@ -110,273 +145,421 @@ class Trainer:
             non_blocking=True,
         )
 
-        with autocast_context(
-            self.device,
-            self.precision,
+        # --------------------------------------------------
+        # DDP optimization
+        #
+        # During gradient accumulation we don't need to
+        # synchronize gradients after every microbatch.
+        # Only synchronize on the final microbatch.
+        # --------------------------------------------------
+
+        if (
+            hasattr(self.model, "no_sync")
+            and not sync_gradients
         ):
-            logits = self.model(x)
-
-            loss = language_modeling_loss(
-                logits,
-                targets,
-            )
-
-        loss_for_backward = (
-            loss
-            / self.gradient_accumulation_steps
-        )
-
-        if self.use_scaler:
-            self.scaler.scale(
-                loss_for_backward
-            ).backward()
+            ddp_context = self.model.no_sync()
         else:
-            loss_for_backward.backward()
+            ddp_context = nullcontext()
+
+        with ddp_context:
+
+            with autocast_context(
+                self.device,
+                self.precision,
+            ):
+                logits = self.model(x)
+
+                loss = language_modeling_loss(
+                    logits,
+                    targets,
+                )
+
+                loss = (
+                    loss
+                    / self.gradient_accumulation_steps
+                )
+
+            # --------------------------------------------------
+            # Backward
+            # --------------------------------------------------
+
+            if self.scaler is not None:
+
+                self.scaler.scale(loss).backward()
+
+            else:
+
+                loss.backward()
 
         return loss.detach()
 
+    # ======================================================
+    # Optimizer step
+    # ======================================================
+
     def optimizer_step(self):
 
-        if self.use_scaler:
-            self.scaler.unscale_(
-                self.optimizer
-            )
+        # --------------------------------------------------
+        # Unscale before gradient clipping
+        # --------------------------------------------------
+
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+
+        # --------------------------------------------------
+        # Gradient clipping
+        # --------------------------------------------------
 
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
             self.max_grad_norm,
         )
 
-        if self.use_scaler:
-            self.scaler.step(
-                self.optimizer
-            )
+        # --------------------------------------------------
+        # Optimizer update
+        # --------------------------------------------------
 
+        if self.scaler is not None:
+
+            self.scaler.step(self.optimizer)
             self.scaler.update()
 
         else:
+
             self.optimizer.step()
+
+        # --------------------------------------------------
+        # Scheduler
+        # --------------------------------------------------
 
         if self.scheduler is not None:
             self.scheduler.step()
+
+        # --------------------------------------------------
+        # Clear gradients
+        # --------------------------------------------------
 
         self.optimizer.zero_grad(
             set_to_none=True
         )
 
-    def save_checkpoint(
-        self,
-        step: int,
-        loss: float,
-    ):
+    # ======================================================
+    # Checkpoint
+    # ======================================================
+
+    def save_checkpoint(self, loss):
+
+        # Only rank 0 writes checkpoints.
+        if not self.is_main_process:
+            return
+
         if self.checkpoint_manager is None:
             return
 
+        model_to_save = self.model
+
+        # DDP wrapper contains the real model in .module
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+
         self.checkpoint_manager.save(
-            model=self.model,
+            step=self.global_step,
+            model=model_to_save,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
-            step=step,
             loss=loss,
         )
 
-    def resume_from_checkpoint(
-        self,
-        path: str,
-    ):
+    # ======================================================
+    # Resume
+    # ======================================================
+
+    def resume_from_checkpoint(self, path):
+
         if self.checkpoint_manager is None:
             raise RuntimeError(
-                "CheckpointManager is required."
+                "No checkpoint manager configured."
             )
 
-        step, loss = (
-            self.checkpoint_manager.load(
-                path=path,
-                model=self.model,
-                optimizer=self.optimizer,
-                scheduler=self.scheduler,
-                scaler=self.scaler,
-                device=self.device,
-            )
+        model_to_load = self.model
+
+        if hasattr(model_to_load, "module"):
+            model_to_load = model_to_load.module
+
+        checkpoint = self.checkpoint_manager.load(
+            path=path,
+            model=model_to_load,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            device=self.device,
         )
 
-        return step, loss
+        self.global_step = checkpoint["step"]
 
-    def evaluate(
-        self,
-        step: int,
-    ):
+        if self.is_main_process:
+            print(
+                f"Resumed from step "
+                f"{self.global_step}"
+            )
+
+        return checkpoint
+
+    # ======================================================
+    # Evaluation
+    # ======================================================
+
+    @torch.no_grad()
+    def evaluate(self):
+
         if self.eval_dataloader is None:
             return None
 
-        validation_loss = evaluate_loss(
-            model=self.model,
-            dataloader=self.eval_dataloader,
-            device=self.device,
+        model_was_training = self.model.training
+
+        self.model.eval()
+
+        loss = evaluate_loss(
+            self.model,
+            self.eval_dataloader,
+            self.device,
             max_batches=self.eval_batches,
         )
 
-        validation_perplexity = perplexity(
-            validation_loss
+        # Restore training mode
+        if model_was_training:
+            self.model.train()
+
+        # --------------------------------------------------
+        # Average evaluation loss across GPUs
+        # --------------------------------------------------
+
+        loss_tensor = torch.tensor(
+            loss,
+            dtype=torch.float32,
+            device=self.device,
         )
 
-        print(
-            f"Step {step:6d} | "
-            f"Val Loss {validation_loss:.4f} | "
-            f"PPL {validation_perplexity:.2f}"
-        )
-
-        if self.logger is not None:
-            self.logger.log_evaluation(
-                step=step,
-                loss=validation_loss,
-                perplexity=validation_perplexity,
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.all_reduce(
+                loss_tensor,
+                op=torch.distributed.ReduceOp.SUM,
             )
 
-            self.logger.flush()
+            loss_tensor /= self.world_size
 
-        self.model.train()
+        loss = loss_tensor.item()
 
-        return validation_loss
+        if self.is_main_process:
+
+            print(
+                f"Step {self.global_step} | "
+                f"Eval Loss {loss:.4f} | "
+                f"Perplexity {perplexity(loss):.2f}"
+            )
+
+            if self.logger is not None:
+                self.logger.log(
+                    "eval/loss",
+                    loss,
+                    self.global_step,
+                )
+
+                self.logger.log(
+                    "eval/perplexity",
+                    perplexity(loss),
+                    self.global_step,
+                )
+
+        return loss
+
+    # ======================================================
+    # Training
+    # ======================================================
 
     def train(
         self,
-        max_steps: int,
-        start_step: int = 0,
+        max_steps,
     ):
-        self.model.train()
 
-        data_iterator = iter(
-            self.dataloader
-        )
+        data_iterator = iter(self.dataloader)
 
-        total_loss = 0.0
+        # --------------------------------------------------
+        # Determine batch size
+        # --------------------------------------------------
 
-        if self.dataloader.batch_size is None:
+        batch_size = self.dataloader.batch_size
+
+        if batch_size is None:
             batch_size = 1
-        else:
-            batch_size = (
-                self.dataloader.batch_size
-            )
+
+        context_length = self.model.config.context_length
+
+        # --------------------------------------------------
+        # Global token count
+        # --------------------------------------------------
 
         tokens_per_microbatch = (
             batch_size
-            * self.model.config.context_length
+            * context_length
         )
 
         tokens_per_step = (
             tokens_per_microbatch
             * self.gradient_accumulation_steps
+            * self.world_size
         )
 
-        for step in range(
-            start_step + 1,
-            max_steps + 1,
-        ):
-            step_start_time = time.time()
+        if self.is_main_process:
 
-            step_loss = 0.0
+            print(
+                f"Tokens per optimizer step: "
+                f"{tokens_per_step:,}"
+            )
 
-            for _ in range(
+            print(
+                f"Starting training from step "
+                f"{self.global_step + 1}"
+            )
+
+        # --------------------------------------------------
+        # Main training loop
+        # --------------------------------------------------
+
+        while self.global_step < max_steps:
+
+            start_time = time.time()
+
+            total_loss = 0.0
+
+            # ----------------------------------------------
+            # Gradient accumulation
+            # ----------------------------------------------
+
+            for micro_step in range(
                 self.gradient_accumulation_steps
             ):
+
                 try:
-                    x, targets = next(
-                        data_iterator
-                    )
+                    batch = next(data_iterator)
 
                 except StopIteration:
                     data_iterator = iter(
                         self.dataloader
                     )
+                    batch = next(data_iterator)
 
-                    x, targets = next(
-                        data_iterator
-                    )
-
-                loss = self.train_step(
-                    x,
-                    targets,
+                is_last_microbatch = (
+                    micro_step
+                    == self.gradient_accumulation_steps - 1
                 )
 
-                step_loss += loss.item()
+                loss = self.train_step(
+                    batch,
+                    sync_gradients=is_last_microbatch,
+                )
+
+                total_loss += loss.item()
+
+            # ----------------------------------------------
+            # Optimizer update
+            # ----------------------------------------------
 
             self.optimizer_step()
 
-            average_loss = (
-                step_loss
-                / self.gradient_accumulation_steps
-            )
+            self.global_step += 1
 
-            total_loss += average_loss
+            elapsed = time.time() - start_time
 
-            step_time = (
-                time.time()
-                - step_start_time
-            )
+            average_loss = total_loss
 
-            tokens_seen = (
-                step * tokens_per_step
-            )
+            # ----------------------------------------------
+            # Learning rate
+            # ----------------------------------------------
 
-            learning_rate = (
-                self.optimizer
-                .param_groups[0]["lr"]
-            )
+            if self.scheduler is not None:
+
+                learning_rate = (
+                    self.scheduler.get_last_lr()[0]
+                )
+
+            else:
+
+                learning_rate = (
+                    self.optimizer.param_groups[0]["lr"]
+                )
+
+            # ----------------------------------------------
+            # Logging
+            # ----------------------------------------------
 
             if (
-                step == start_step + 1
-                or step % 10 == 0
+                self.is_main_process
+                and self.global_step % self.log_interval == 0
             ):
+
+                tokens_per_second = (
+                    tokens_per_step / elapsed
+                )
+
                 print(
-                    f"Step {step:6d} | "
+                    f"Step {self.global_step:6d} | "
                     f"Loss {average_loss:.4f} | "
-                    f"LR {learning_rate:.8f} | "
-                    f"Time {step_time:.2f}s"
+                    f"LR {learning_rate:.6g} | "
+                    f"{tokens_per_second:,.0f} tok/s | "
+                    f"{elapsed:.2f}s"
                 )
 
-            if self.logger is not None:
-                self.logger.log_train(
-                    step=step,
-                    loss=average_loss,
-                    learning_rate=learning_rate,
-                    tokens_seen=tokens_seen,
-                )
+                if self.logger is not None:
 
-                self.logger.log_step_time(
-                    step=step,
-                    seconds=step_time,
-                )
+                    self.logger.log(
+                        "train/loss",
+                        average_loss,
+                        self.global_step,
+                    )
+
+                    self.logger.log(
+                        "train/learning_rate",
+                        learning_rate,
+                        self.global_step,
+                    )
+
+                    self.logger.log(
+                        "train/tokens_per_second",
+                        tokens_per_second,
+                        self.global_step,
+                    )
+
+            # ----------------------------------------------
+            # Evaluation
+            # ----------------------------------------------
 
             if (
-                self.eval_dataloader is not None
-                and self.eval_interval > 0
-                and step % self.eval_interval == 0
+                self.eval_interval > 0
+                and self.global_step % self.eval_interval == 0
             ):
-                self.evaluate(step)
+                self.evaluate()
+
+            # ----------------------------------------------
+            # Checkpoint
+            # ----------------------------------------------
 
             if (
-                self.checkpoint_manager is not None
-                and self.checkpoint_interval > 0
-                and step % self.checkpoint_interval == 0
+                self.checkpoint_interval > 0
+                and self.global_step
+                % self.checkpoint_interval
+                == 0
             ):
                 self.save_checkpoint(
-                    step=step,
-                    loss=average_loss,
+                    average_loss
                 )
 
-            if self.logger is not None:
-                self.logger.flush()
-
-        steps_completed = (
-            max_steps - start_step
-        )
-
-        if steps_completed <= 0:
-            return 0.0
-
-        return (
-            total_loss
-            / steps_completed
-        )
+        if self.is_main_process:
+            print(
+                f"Training complete at step "
+                f"{self.global_step}"
+            )

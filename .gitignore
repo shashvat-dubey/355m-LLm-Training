@@ -46,3 +46,4 @@ Thumbs.db
 *.temp
 
 tests/
+training/embeddings.py

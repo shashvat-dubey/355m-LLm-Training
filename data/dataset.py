@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 from datasets import load_dataset
 
 from config.data_config import DataConfig
@@ -17,7 +17,6 @@ class FineWebDataset(IterableDataset):
 
         self.data_config = data_config
         self.context_length = model_config.context_length
-
         self.tokenizer = GPTTokenizer()
 
     def _load_dataset(self):
@@ -32,33 +31,107 @@ class FineWebDataset(IterableDataset):
 
         dataset = self._load_dataset()
 
-        # Store unused tokens between documents
+        # --------------------------------------------------
+        # Distributed rank
+        # --------------------------------------------------
+
+        rank = 0
+        world_size = 1
+
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+
+        # --------------------------------------------------
+        # DataLoader worker information
+        # --------------------------------------------------
+
+        worker_info = get_worker_info()
+
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        # --------------------------------------------------
+        # Treat every GPU + worker as one data worker
+        # --------------------------------------------------
+
+        global_worker_id = (
+            rank * num_workers + worker_id
+        )
+
+        total_workers = (
+            world_size * num_workers
+        )
+
+        # --------------------------------------------------
+        # Prefer HuggingFace streaming sharding
+        # --------------------------------------------------
+
+        try:
+            dataset = dataset.shard(
+                num_shards=total_workers,
+                index=global_worker_id,
+            )
+
+            use_shard = True
+
+        except AttributeError:
+            use_shard = False
+
+        # --------------------------------------------------
+        # Token buffer
+        # --------------------------------------------------
+
         token_buffer = []
 
-        for example in dataset:
+        for example_index, example in enumerate(dataset):
+
+            # --------------------------------------------------
+            # Fallback sharding
+            # --------------------------------------------------
+
+            if not use_shard:
+
+                if (
+                    example_index % total_workers
+                    != global_worker_id
+                ):
+                    continue
+
+            # --------------------------------------------------
+            # Tokenize
+            # --------------------------------------------------
 
             text = example["text"]
 
-            # Convert text → token IDs
             tokens = self.tokenizer.encode(text)
 
-            # Mark document boundary
             tokens.append(
-                self.tokenizer.encoding.eot_token
+                self.tokenizer.eot_token_id
             )
 
-            # Add tokens to our continuous stream
             token_buffer.extend(tokens)
 
-            # Create fixed-length training examples
-            while len(token_buffer) >= self.context_length + 1:
+            # --------------------------------------------------
+            # Produce fixed-length sequences
+            # --------------------------------------------------
 
-                # Grab enough tokens for input + target
+            while (
+                len(token_buffer)
+                >= self.context_length + 1
+            ):
+
                 chunk = token_buffer[
-                    :self.context_length + 1
+                    : self.context_length + 1
                 ]
 
-                # Remove the consumed tokens
                 token_buffer = token_buffer[
                     self.context_length:
                 ]
@@ -74,29 +147,3 @@ class FineWebDataset(IterableDataset):
                 )
 
                 yield x, y
-
-
-if __name__ == "__main__":
-    from config.data_config import DataConfig
-    from config.model_config import GPTConfig
-
-    data_config = DataConfig()
-    model_config = GPTConfig()
-
-    dataset = FineWebDataset(
-        data_config=data_config,
-        model_config=model_config,
-    )
-
-    iterator = iter(dataset)
-
-    x, y = next(iterator)
-
-    print("Input shape:", x.shape)
-    print("Target shape:", y.shape)
-
-    print("\nFirst 20 input tokens:")
-    print(x[:20].tolist())
-
-    print("\nFirst 20 target tokens:")
-    print(y[:20].tolist())

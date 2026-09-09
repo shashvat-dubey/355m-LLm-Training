@@ -1,16 +1,30 @@
 import torch
 
 
-def get_device() -> torch.device:
+def get_device(
+    local_rank=None,
+) -> torch.device:
+
     if torch.cuda.is_available():
+
+        if local_rank is not None:
+            return torch.device(
+                f"cuda:{local_rank}"
+            )
+
         return torch.device("cuda")
 
     return torch.device("cpu")
 
 
-def get_device_name(device: torch.device) -> str:
+def get_device_name(
+    device: torch.device,
+) -> str:
+
     if device.type == "cuda":
-        return torch.cuda.get_device_name(device)
+        return torch.cuda.get_device_name(
+            device
+        )
 
     return "CPU"
 
@@ -18,10 +32,18 @@ def get_device_name(device: torch.device) -> str:
 if __name__ == "__main__":
     device = get_device()
 
-    print("Device:", device)
-    print("Device name:", get_device_name(device))
+    print(
+        "Device:",
+        device,
+    )
+
+    print(
+        "Device name:",
+        get_device_name(device),
+    )
 
     if device.type == "cuda":
+
         print(
             "CUDA version:",
             torch.version.cuda,
