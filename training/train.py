@@ -32,8 +32,9 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
 
     dist.init_process_group(
-        backend="nccl"
-    )
+    backend="nccl",
+    device_id=local_rank,
+    )   
 
     return rank, local_rank, world_size
 
@@ -203,7 +204,7 @@ def main():
     if is_main_process:
 
         checkpoint_manager = CheckpointManager(
-            checkpoint_dir="checkpoints",
+            directory="checkpoints",
             max_checkpoints=2,
         )
 
@@ -282,8 +283,26 @@ def main():
     # Cleanup
     # --------------------------------------------------
 
+        # --------------------------------------------------------
+    # Synchronize before shutdown
+    # --------------------------------------------------------
+
+    if world_size > 1:
+        dist.barrier()
+
+    # --------------------------------------------------------
+    # Close logger on rank 0
+    # --------------------------------------------------------
+
     if logger is not None:
         logger.close()
+
+    # --------------------------------------------------------
+    # Final synchronization
+    # --------------------------------------------------------
+
+    if world_size > 1:
+        dist.barrier()
 
     cleanup_distributed()
 
