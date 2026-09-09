@@ -1,0 +1,7 @@
+torch
+numpy
+tqdm
+tensorboard
+tiktoken
+datasets
+transformers
