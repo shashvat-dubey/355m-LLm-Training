@@ -90,7 +90,7 @@ def main():
         log_interval=10,
 
         eval_interval=0,
-        checkpoint_interval=0,
+        checkpoint_interval=500,
     )
 
     # --------------------------------------------------
@@ -216,9 +216,7 @@ def main():
 
     if is_main_process:
 
-        logger = TensorBoardLogger(
-            log_dir="runs/355m_gpt"
-        )
+        logger = None
 
     # --------------------------------------------------
     # Trainer
